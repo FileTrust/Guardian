@@ -1,0 +1,49 @@
+x-guardian: &guardian
+  image: filetrust-guardian:${FILETRUST_DOCKER_PROJECT:-filetrust-guardian}
+  build:
+    context: .
+    target: runtime
+  platform: linux/amd64
+  init: true
+  # Linux server package: reuse working host DNS/routes without opening a port.
+  network_mode: host
+  read_only: true
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /run/filetrust-guardian:rw,nosuid,nodev,noexec,size=256m,uid=10001,gid=10001,mode=0700
+    - /opt/filetrust-guardian/.filetrust-updates:rw,nosuid,nodev,noexec,size=4m,uid=10001,gid=10001,mode=0755
+    - /tmp:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700
+  ulimits:
+    core: 0
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+
+services:
+  node:
+    <<: *guardian
+    command: [run]
+    restart: unless-stopped
+    stop_grace_period: 1h
+    volumes:
+      - state:/var/lib/filetrust-guardian
+      - credentials:/etc/filetrust-guardian:ro
+    healthcheck:
+      test: [CMD, python, /opt/filetrust-guardian/container_cli.py, health]
+      interval: 30s
+      timeout: 5s
+      start_period: 15m
+      retries: 3
+  setup:
+    <<: *guardian
+    profiles: [tools]
+    command: [idle]
+    volumes:
+      - state:/var/lib/filetrust-guardian
+      - credentials:/etc/filetrust-guardian
+
+volumes:
+  state:
+  credentials:

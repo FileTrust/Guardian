@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "product": "guardians",
+  "repository": "FileTrust/Guardian",
+  "metadata_tag": "filetrust-updates",
+  "channel": "stable"
+}

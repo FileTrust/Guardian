@@ -1,0 +1,247 @@
+{
+  "protocol": "filetrust-dkg-recovery-v1",
+  "contractName": "DkgCommitmentBook",
+  "abi": [
+    {
+      "inputs": [],
+      "name": "InvalidCommitments",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "controller",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint8",
+          "name": "",
+          "type": "uint8"
+        }
+      ],
+      "name": "dealerWeight",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "materialId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint8",
+          "name": "index",
+          "type": "uint8"
+        }
+      ],
+      "name": "expectedShare",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "x",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "y",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "materialId",
+          "type": "bytes32"
+        }
+      ],
+      "name": "getAggregate",
+      "outputs": [
+        {
+          "internalType": "uint256[]",
+          "name": "xs",
+          "type": "uint256[]"
+        },
+        {
+          "internalType": "uint256[]",
+          "name": "ys",
+          "type": "uint256[]"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "components": [
+            {
+              "internalType": "bytes32",
+              "name": "materialId",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "fileId",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "dataOwner",
+              "type": "address"
+            },
+            {
+              "internalType": "uint32",
+              "name": "epoch",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint32",
+              "name": "version",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint32",
+              "name": "oldVersion",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint8",
+              "name": "oldT",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "newT",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint64",
+              "name": "unopenedDeadline",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bool",
+              "name": "refresh",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "publicKeyX",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "publicKeyY",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "oldGuardians",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address[]",
+              "name": "receivers",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint8[]",
+              "name": "dealerIndices",
+              "type": "uint8[]"
+            }
+          ],
+          "internalType": "struct DkgAttemptTypes.Request",
+          "name": "r",
+          "type": "tuple"
+        },
+        {
+          "internalType": "address",
+          "name": "coordinator",
+          "type": "address"
+        }
+      ],
+      "name": "open",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "materialId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint8",
+          "name": "index",
+          "type": "uint8"
+        },
+        {
+          "internalType": "uint256[]",
+          "name": "xs",
+          "type": "uint256[]"
+        },
+        {
+          "internalType": "uint256[]",
+          "name": "ys",
+          "type": "uint256[]"
+        }
+      ],
+      "name": "record",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "materialId",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "x",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "y",
+          "type": "uint256"
+        }
+      ],
+      "name": "validateKey",
+      "outputs": [],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ]
+}

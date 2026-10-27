@@ -1,0 +1,16 @@
+.venv/
+.filetrust-updates/
+.filetrust-activity/
+.filetrust-node-health.json
+__pycache__/
+*.pyc
+downloads/
+artifacts/
+wallet.json
+unlock.key
+config.json
+installation-selection.json
+dist/
+
+.network-updates/
+network-config-active.json
