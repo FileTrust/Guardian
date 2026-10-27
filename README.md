@@ -219,7 +219,7 @@ account and your source clone:
 
 ```sh
 sudo userdel ftguardian
-cd "$HOME" && rm -rf -- "$HOME/FileTrust-Guardians"
+cd "$HOME" && rm -rf -- "$HOME/Guardian"
 ```
 
 The last command permanently deletes that source folder; change the path if you
