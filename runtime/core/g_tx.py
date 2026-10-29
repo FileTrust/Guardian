@@ -39,6 +39,21 @@ _AMBIGUOUS_SEND_MARKERS = (
     "eof",
 )
 
+
+def read_contract_value(function, attempts=8):
+    """Retry transient read failures; never turn uncertainty into no stake/node."""
+    from requests.exceptions import ConnectionError, HTTPError, Timeout
+    for attempt in range(attempts):
+        try:
+            return function.call()
+        except (ConnectionError, HTTPError, Timeout) as error:
+            if isinstance(error, HTTPError) and (error.response is None or
+                    error.response.status_code != 429 and error.response.status_code < 500):
+                raise
+            if attempt == attempts - 1:
+                raise
+            time.sleep(min(8, 0.5 * 2**attempt))
+
 PreTxOutcome = Literal["submitted", "complete", "retry"]
 
 
@@ -109,7 +124,9 @@ def _send_raw_with_ambiguity_recovery(w3: Web3, raw: bytes):
             message = str(exc).lower()
             if any(marker in message for marker in _ALREADY_KNOWN_MARKERS):
                 return expected_hash
-            if not any(marker in message for marker in _AMBIGUOUS_SEND_MARKERS):
+            response = getattr(exc, 'response', None)
+            transient_http = response is not None and (response.status_code == 429 or response.status_code >= 500)
+            if not transient_http and not any(marker in message for marker in _AMBIGUOUS_SEND_MARKERS):
                 raise
             if attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
@@ -142,6 +159,7 @@ def send_contract_transaction(
             # PRE/share-proof workers must not sign a different transaction at
             # that nonce while recovery confirmation remains uncertain.
             require_no_pending_recovery_transaction(lock_root)
+            require_no_pending_heartbeat_transaction(lock_root)
             nonce = int(w3.eth.get_transaction_count(account.address, "pending"))
             tx_fields = {
                 "from": account.address,
@@ -188,3 +206,14 @@ def require_no_pending_recovery_transaction(lock_root=None):
         from .g_dkg_identity import read_private_json
         if not read_private_json(path).get('complete'):
             raise RuntimeError('A recovery transaction is awaiting confirmation; retaining its reserved wallet nonce')
+
+
+def require_no_pending_heartbeat_transaction(lock_root=None):
+    if lock_root is None:
+        import core.g_config as cfg
+        lock_root = cfg.ROOT
+    path = Path(lock_root) / 'state' / 'registry-heartbeat.json'
+    if path.exists() or path.is_symlink():
+        from .g_secret_files import read_secret_json
+        if read_secret_json(path):
+            raise RuntimeError('A heartbeat transaction is awaiting confirmation; retaining its reserved wallet nonce')

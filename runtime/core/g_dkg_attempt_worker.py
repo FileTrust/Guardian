@@ -363,23 +363,29 @@ class AttemptWorker:
                 self._receive(mat, j, r, role, context)
             return True
 
-    def scan(self, *, page_size=32):
+    def scan(self, *, page_size=4):
         """Bounded round-robin discovery plus durable accepted-duty recovery."""
-        count = self.c.acl.functions.getFileCount().call()
-        cursor = getattr(self, '_cursor', 0) % max(1, count)
         pending = set()
-        for offset in range(min(page_size, count)):
-            self._check_stop()
-            file_id = self.c.acl.functions.getFileIdAt((cursor+offset) % count).call()
-            registry_id = self.c.registry.functions.activeAttemptOf(file_id).call()
-            if any(registry_id):
-                mat = self.c.controller.functions.materialForRegistryId(registry_id).call()
-                pending.add(hex32(mat))
-        self._cursor = (cursor + page_size) % max(1, count)
         with private_lock(self.root / 'catalog'):
             jobs = list(self._catalog().items())
         pending.update(mat for mat, saved in jobs if not saved['done'])
         errors = []
+        try:
+            count = self.c.acl.functions.getFileCount().call()
+            cursor = getattr(self, '_cursor', 0) % max(1, count)
+            for offset in range(min(page_size, count)):
+                self._check_stop()
+                index = (cursor+offset) % count
+                file_id = self.c.acl.functions.getFileIdAt(index).call()
+                registry_id = self.c.registry.functions.activeAttemptOf(file_id).call()
+                if any(registry_id):
+                    mat = self.c.controller.functions.materialForRegistryId(registry_id).call()
+                    pending.add(hex32(mat))
+                # Preserve discovery progress when a later read is throttled.
+                self._cursor = (index + 1) % count
+        except (ConnectionError, Timeout, HTTPError) as error:
+            errors.append(('discovery', type(error).__name__))
+            # Discovery trouble must not withhold already accepted duties.
         for mat in sorted(pending):
             self._check_stop()
             try:
@@ -417,6 +423,8 @@ def run(cfg, w3, account):
     from . import g_lifecycle
     from .g_dkg_attempt_tx import PendingTransaction
     from .g_log import log_every
+    from .g_dkg_rpc import install_read_pacing
+    install_read_pacing(w3, getattr(cfg, 'DKG_RECOVERY', {}).get('rpc_read_interval_seconds', 0), g_lifecycle.STOP)
     delay = 2.0
     while not g_lifecycle.STOP.is_set():
         try:

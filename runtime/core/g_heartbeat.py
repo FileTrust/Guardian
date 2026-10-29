@@ -5,7 +5,8 @@ import time
 from pathlib import Path
 
 from web3 import Web3
-from .g_tx import _account_transaction_lock, _raw_transaction, _send_raw_with_ambiguity_recovery
+from .g_tx import (_account_transaction_lock, _raw_transaction, _send_raw_with_ambiguity_recovery,
+                   require_no_pending_recovery_transaction)
 from .g_secret_files import read_secret_json, write_json_atomic
 
 INTERVAL = 1800
@@ -46,6 +47,7 @@ def heartbeat_tick(w3, cfg, root, log=lambda message: None):
                 path.unlink()
                 return 'replaced'
         else:
+            require_no_pending_recovery_transaction(root)
             nonce = int(w3.eth.get_transaction_count(account.address, 'pending'))
             if nonce != int(w3.eth.get_transaction_count(account.address, 'latest')):
                 return 'busy'

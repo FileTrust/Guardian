@@ -84,13 +84,14 @@ def _wait_for_chain(cfg: dict):
     from web3 import Web3
 
     registry_address = cfg.get("guardian_registry_address", "")
+    from core.g_dkg_rpc import ReadRetryHTTPProvider
     attempt = 0
     while True:
         if g_lifecycle.STOP.is_set():
             raise SystemExit(0)
         attempt += 1
         try:
-            w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
+            w3 = Web3(ReadRetryHTTPProvider(cfg["rpc_url"], request_kwargs={"timeout": 30}))
             if not w3.is_connected():
                 reason = "no answer yet"
             else:
@@ -306,13 +307,14 @@ def _ensure_enc_key(cfg: dict, allow_new_key: bool = False, w3=None) -> bool:
 def _register(cfg: dict, w3=None) -> None:
     from web3 import Web3
     from core import g_txlog as TX
+    from core.g_tx import read_contract_value
     TX.install(cfg)
 
     if w3 is None:
         w3 = _wait_for_chain(cfg)
 
     account = w3.eth.account.from_key(cfg["private_key"])
-    address = cfg["address"]
+    address = Web3.to_checksum_address(cfg["address"])
     if account.address.lower() != address.lower():
         raise ValueError(f"[{NAME}] private key does not match address")
 
@@ -333,31 +335,33 @@ def _register(cfg: dict, w3=None) -> None:
         print(f"[{NAME}] GuardianRegistry not configured — skipping registration")
         return
 
-    min_stake = 0
-    try:
-        min_stake = int(gr.functions.minStake().call())
-    except Exception:
-        pass
+    min_stake = int(read_contract_value(gr.functions.minStake()))
     if staking:
-        try:
-            min_stake = int(staking.functions.minStake().call())
-        except Exception:
-            pass
+        min_stake = int(read_contract_value(staking.functions.minStake()))
     if min_stake <= 0:
         try:
             min_stake = int(cfg.get("min_guardian_stake_wei", 0))
         except Exception:
             pass
 
+    # The explicit development profile provisions its approved bond reserve.
+    # This is the operator's stake target; protocol minimums stay on chain.
+    reserve = cfg.get("dkg_recovery", {}).get("test_stake_reserve_wei", 0)
+    if reserve:
+        limits = cfg["dkg_recovery"].get("acceptance", {})
+        if (type(reserve) is not int or reserve < 0 or
+                cfg.get("dkg_attempt_protocol") != 1 or
+                int(w3.eth.chain_id) not in (31337, 31338, 31339) or
+                limits.get("enabled") is not True or
+                reserve != limits.get("max_bond_wei", 0) * limits.get("max_concurrent_attempts", 0)):
+            raise ValueError("Invalid explicit development Guardian bond reserve")
+    target_stake = min_stake + reserve
+
     key_data = read_secret_json(_KEY_PATH)
     pubkey   = bytes.fromhex(key_data["public_key_hex"].replace("0x", ""))
     metadata = f"guardian-{cfg['guardian_index']}"
 
-    already = False
-    try:
-        already = bool(gr.functions.isRegisteredGuardian(address).call())
-    except Exception:
-        pass
+    already = bool(read_contract_value(gr.functions.isRegisteredGuardian(address)))
 
     try:
         from core.g_pricing import normalize_guardian_service_prices, sync_guardian_service_pricing
@@ -371,14 +375,11 @@ def _register(cfg: dict, w3=None) -> None:
         _send_tx(w3, account,
                  gr.functions.updateGuardian(pubkey, metadata, 0, 0, 0),
                  "updateGuardian")
-        stake_now = 0
-        try:
-            stake_now = int(staking.functions.stakeOf(address).call()) if staking                         else int(gr.functions.getGuardian(address).call()[8])
-        except Exception:
-            pass
-        if stake_now < min_stake:
+        stake_now = int(read_contract_value(staking.functions.stakeOf(address))) if staking \
+                    else int(read_contract_value(gr.functions.getGuardian(address))[8])
+        if stake_now < target_stake:
             fn = staking.functions.depositStake() if staking else gr.functions.depositStake()
-            _send_tx(w3, account, fn, "depositStake (top-up)", value=min_stake - stake_now)
+            _send_tx(w3, account, fn, "depositStake (top-up)", value=target_stake - stake_now)
         try:
             sync_guardian_service_pricing(
                 w3=w3, guardian_registry=gr, account=account,
@@ -387,7 +388,7 @@ def _register(cfg: dict, w3=None) -> None:
         except Exception as exc:
             print(f"[{NAME}] service pricing sync skipped: {exc}")
     else:
-        print(f"[{NAME}] registering  stake={min_stake} wei")
+        print(f"[{NAME}] registering  stake={target_stake} wei")
         _send_tx(w3, account,
                  gr.functions.registerGuardian(
                      pubkey, metadata, 0, 0, 0,
@@ -397,7 +398,7 @@ def _register(cfg: dict, w3=None) -> None:
                      int(_prices["daily_share_custody_su"]),
                      int(_prices.get("max_service_days", 0)),
                  ),
-                 "registerGuardian", value=min_stake)
+                 "registerGuardian", value=target_stake)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,8 @@ from web3.exceptions import TransactionNotFound
 from .g_dkg_identity import private_lock, read_private_json
 from .g_secret_files import write_json_atomic
 from .g_tx import (_account_transaction_lock, _raw_transaction,
-                  _send_raw_with_ambiguity_recovery, recovery_outbox_root)
+                  _send_raw_with_ambiguity_recovery, recovery_outbox_root,
+                  require_no_pending_heartbeat_transaction)
 
 
 class PendingTransaction(RuntimeError):
@@ -73,6 +74,7 @@ class DurableSender:
                         return receipt
             gas, price = self.gas_quote(fn)
             with _account_transaction_lock(self.nonce_root):
+                require_no_pending_heartbeat_transaction(self.nonce_root)
                 transaction = fn.build_transaction({'from': self.account.address,
                     'chainId': self.w3.eth.chain_id,
                     'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
@@ -89,6 +91,57 @@ class DurableSender:
                 except Exception:
                     raise PendingTransaction('DKG broadcast is uncertain; retaining the signed envelope') from None
             return self._finish(entry)
+
+    def reconcile_replacement(self, replacement_hash):
+        """Explicit operator recovery of a canonically replaced envelope.
+
+        Never broadcasts or signs. A higher nonce alone is insufficient: the
+        different confirmed transaction must consume this wallet's exact nonce.
+        Keep the original envelope in an immutable audit record before release.
+        """
+        from eth_account import Account
+        from eth_account._utils.legacy_transactions import Transaction
+        from hexbytes import HexBytes
+        with private_lock(self.root), _account_transaction_lock(self.nonce_root):
+            path = self.root / 'outbox.json'
+            entry = read_private_json(path)
+            if entry.get('complete'):
+                return False
+            raw = bytes.fromhex(entry['raw'])
+            original = Web3.keccak(raw)
+            if (entry['chain_id'] != self.w3.eth.chain_id or
+                    entry['address'].lower() != self.account.address.lower() or
+                    Account.recover_transaction(raw).lower() != self.account.address.lower() or
+                    original != HexBytes(entry['hash'])):
+                raise RuntimeError('DKG outbox identity or network mismatch')
+            try:
+                self.w3.eth.get_transaction_receipt(original)
+            except TransactionNotFound:
+                pass
+            else:
+                raise RuntimeError('Original transaction already has a receipt; use normal recovery')
+            nonce = Transaction.from_bytes(raw).nonce
+            tx = self.w3.eth.get_transaction(replacement_hash)
+            receipt = self.w3.eth.get_transaction_receipt(replacement_hash)
+            if (HexBytes(tx['hash']) != HexBytes(replacement_hash) or HexBytes(tx['hash']) == original or
+                    tx['from'].lower() != self.account.address.lower() or tx['nonce'] != nonce or
+                    receipt['blockNumber'] is None or not receipt['blockHash'] or
+                    HexBytes(tx['blockHash']) != HexBytes(receipt['blockHash']) or
+                    HexBytes(receipt['transactionHash']) != HexBytes(tx['hash'])):
+                raise RuntimeError('Replacement does not confirm the reserved wallet nonce')
+            block = self.w3.eth.get_block(receipt['blockNumber'])
+            if (HexBytes(block['hash']) != HexBytes(receipt['blockHash']) or
+                    self.w3.eth.get_transaction_count(self.account.address, 'latest') <= nonce):
+                raise RuntimeError('Replacement is not confirmed on the current canonical chain')
+            archived = {**entry, 'complete': True, 'outcome': 'replaced',
+                'replacement_hash': Web3.to_hex(HexBytes(replacement_hash)),
+                'replacement_block_hash': Web3.to_hex(HexBytes(block['hash']))}
+            archive = self.root / 'replaced' / (original.hex()+'.json')
+            if archive.exists() and read_private_json(archive) != archived:
+                raise RuntimeError('Existing replacement audit record differs')
+            write_json_atomic(archive, archived)
+            write_json_atomic(path, archived)
+            return True
 
     def recover(self):
         """Drain an outstanding envelope even if its job closed meanwhile.
