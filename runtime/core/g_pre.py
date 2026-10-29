@@ -158,7 +158,8 @@ def main() -> None:
     from core import g_txlog as TX
     TX.install(cfg)
 
-    w3 = Web3(Web3.HTTPProvider(cfg.RPC_URL))
+    from core.g_dkg_rpc import ReadRetryHTTPProvider
+    w3 = Web3(ReadRetryHTTPProvider(cfg.RPC_URL, request_kwargs={"timeout": 30}))
     connection_attempt = 0
     while not w3.is_connected():
         if g_lifecycle.STOP.is_set():
