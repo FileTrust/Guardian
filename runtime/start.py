@@ -479,6 +479,9 @@ def main() -> int:
         return 2
     if g_lifecycle.STOP.is_set():
         return 0
+    from core.g_startup_tx import recover_pending_transactions
+    if not recover_pending_transactions(w3, cfg, ROOT, g_lifecycle.STOP, _say):
+        return 0
     _register(cfg, w3)
     if g_lifecycle.STOP.is_set():
         return 0
