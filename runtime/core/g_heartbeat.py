@@ -6,7 +6,8 @@ from pathlib import Path
 
 from web3 import Web3
 from .g_tx import (_account_transaction_lock, _raw_transaction, _send_raw_with_ambiguity_recovery,
-                   require_no_pending_recovery_transaction)
+                   require_no_pending_recovery_transaction, recover_regular_transaction,
+                   next_guardian_nonce, record_guardian_confirmation, PendingGuardianTransaction)
 from .g_secret_files import read_secret_json, write_json_atomic
 
 INTERVAL = 1800
@@ -16,6 +17,12 @@ def next_slot(now, chain_id, address, interval=INTERVAL):
     identity = f"filetrust:registry-heartbeat:{chain_id}:{address.lower()}".encode()
     phase = int.from_bytes(hashlib.sha256(identity).digest()[:8], 'big') % interval
     return ((int(now) - phase) // interval + 1) * interval + phase
+
+
+def initial_due(now, chain_id, address, *, chain_now, last_heartbeat):
+    """Resume an overdue registry heartbeat instead of waiting another slot."""
+    remaining = max(0, INTERVAL - max(0, int(chain_now) - int(last_heartbeat)))
+    return min(next_slot(now, chain_id, address), now + remaining)
 
 
 def heartbeat_tick(w3, cfg, root, log=lambda message: None):
@@ -38,6 +45,9 @@ def heartbeat_tick(w3, cfg, root, log=lambda message: None):
                     raise
                 receipt = None
             if receipt is not None:
+                if Web3.to_hex(receipt['transactionHash']).lower() != pending['hash'].lower():
+                    raise PendingGuardianTransaction('Heartbeat receipt differs from its signed transaction')
+                record_guardian_confirmation(w3, account.address, pending['nonce'], receipt, root)
                 path.unlink()
                 if int(receipt['status']) == 1:
                     log(f"[heartbeat] confirmed tx={pending['hash']}")
@@ -48,7 +58,8 @@ def heartbeat_tick(w3, cfg, root, log=lambda message: None):
                 return 'replaced'
         else:
             require_no_pending_recovery_transaction(root)
-            nonce = int(w3.eth.get_transaction_count(account.address, 'pending'))
+            recover_regular_transaction(w3, account.address, root)
+            nonce = next_guardian_nonce(w3, account.address, root)
             if nonce != int(w3.eth.get_transaction_count(account.address, 'latest')):
                 return 'busy'
             data = '0x' + Web3.keccak(text='heartbeat()')[:4].hex().removeprefix('0x')
@@ -71,7 +82,18 @@ def start(cfg, root, stop, log=print):
         while not stop.is_set():
             try:
                 if due is None:
-                    due = next_slot(time.time(), int(w3.eth.chain_id), cfg['address'])
+                    now, chain_id = time.time(), int(w3.eth.chain_id)
+                    candidate_due = next_slot(now, chain_id, cfg['address'])
+                    if cfg.get('dkg_attempt_protocol') == 1:
+                        from .g_dkg_recovery_contracts import contract, record
+                        registry = contract(w3, 'GuardianRegistry', cfg['guardian_registry_address'])
+                        status = record(registry.functions.getGuardianOperationalStatus(
+                            Web3.to_checksum_address(cfg['address'])))
+                        if not status.registered:
+                            raise ValueError('Heartbeat requires an existing Guardian registration')
+                        candidate_due = initial_due(now, chain_id, cfg['address'],
+                            chain_now=w3.eth.get_block('latest')['timestamp'], last_heartbeat=status.lastHeartbeat)
+                    due = candidate_due
                 pending = (Path(root) / 'state' / 'registry-heartbeat.json').exists()
                 if pending or time.time() >= due:
                     result = heartbeat_tick(w3, cfg, root, log)

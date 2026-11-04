@@ -11,11 +11,12 @@ from .g_dkg_identity import private_lock, read_private_json
 from .g_secret_files import write_json_atomic
 from .g_tx import (_account_transaction_lock, _raw_transaction,
                   _send_raw_with_ambiguity_recovery, recovery_outbox_root,
-                  require_no_pending_heartbeat_transaction)
+                  require_no_pending_heartbeat_transaction, recover_regular_transaction,
+                  next_guardian_nonce, record_guardian_confirmation,
+                  PendingGuardianTransaction, regular_outbox_root)
 
 
-class PendingTransaction(RuntimeError):
-    pass
+PendingTransaction = PendingGuardianTransaction
 
 
 class DurableSender:
@@ -55,10 +56,18 @@ class DurableSender:
             try:
                 _send_raw_with_ambiguity_recovery(self.w3, raw)
                 receipt = self.w3.eth.wait_for_transaction_receipt(expected, timeout=self.timeout)
+            except PendingGuardianTransaction:
+                raise
             except Exception:
                 raise PendingTransaction('DKG transaction confirmation is uncertain; retaining the signed envelope') from None
         # Save a completed result before returning to the calling state machine.
-        write_json_atomic(self.root / 'outbox.json', {**entry, 'complete': True})
+        from eth_account._utils.legacy_transactions import Transaction
+        with _account_transaction_lock(self.nonce_root):
+            if Web3.to_hex(receipt['transactionHash']) != Web3.to_hex(expected):
+                raise PendingTransaction('Receipt differs from the reserved DKG transaction')
+            record_guardian_confirmation(self.w3, self.account.address,
+                Transaction.from_bytes(raw).nonce, receipt, self.nonce_root)
+            write_json_atomic(self.root / 'outbox.json', {**entry, 'complete': True})
         if int(receipt['status']) != 1:
             raise RuntimeError('DKG transaction reverted; review its on-chain receipt')
         return receipt
@@ -75,9 +84,10 @@ class DurableSender:
             gas, price = self.gas_quote(fn)
             with _account_transaction_lock(self.nonce_root):
                 require_no_pending_heartbeat_transaction(self.nonce_root)
+                recover_regular_transaction(self.w3, self.account.address, self.nonce_root)
                 transaction = fn.build_transaction({'from': self.account.address,
                     'chainId': self.w3.eth.chain_id,
-                    'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
+                    'nonce': next_guardian_nonce(self.w3, self.account.address, self.nonce_root),
                     'gas': gas, 'gasPrice': price})
                 raw = _raw_transaction(self.account.sign_transaction(transaction))
                 entry = {'chain_id': self.w3.eth.chain_id, 'address': self.account.address,
@@ -88,11 +98,13 @@ class DurableSender:
                 # have been attempted. Uncertain sends retain this same nonce.
                 try:
                     _send_raw_with_ambiguity_recovery(self.w3, raw)
+                except PendingGuardianTransaction:
+                    raise
                 except Exception:
                     raise PendingTransaction('DKG broadcast is uncertain; retaining the signed envelope') from None
             return self._finish(entry)
 
-    def reconcile_replacement(self, replacement_hash):
+    def reconcile_replacement(self, replacement_hash, *, kind='recovery'):
         """Explicit operator recovery of a canonically replaced envelope.
 
         Never broadcasts or signs. A higher nonce alone is insufficient: the
@@ -102,8 +114,11 @@ class DurableSender:
         from eth_account import Account
         from eth_account._utils.legacy_transactions import Transaction
         from hexbytes import HexBytes
-        with private_lock(self.root), _account_transaction_lock(self.nonce_root):
-            path = self.root / 'outbox.json'
+        if kind not in ('recovery', 'regular'):
+            raise ValueError('Unknown Guardian transaction outbox kind')
+        root = self.root if kind == 'recovery' else regular_outbox_root(self.nonce_root)
+        with private_lock(root), _account_transaction_lock(self.nonce_root):
+            path = root / 'outbox.json'
             entry = read_private_json(path)
             if entry.get('complete'):
                 return False
@@ -136,10 +151,11 @@ class DurableSender:
             archived = {**entry, 'complete': True, 'outcome': 'replaced',
                 'replacement_hash': Web3.to_hex(HexBytes(replacement_hash)),
                 'replacement_block_hash': Web3.to_hex(HexBytes(block['hash']))}
-            archive = self.root / 'replaced' / (original.hex()+'.json')
+            archive = root / 'replaced' / (original.hex()+'.json')
             if archive.exists() and read_private_json(archive) != archived:
                 raise RuntimeError('Existing replacement audit record differs')
             write_json_atomic(archive, archived)
+            record_guardian_confirmation(self.w3, self.account.address, nonce, receipt, self.nonce_root)
             write_json_atomic(path, archived)
             return True
 
@@ -150,6 +166,11 @@ class DurableSender:
         the shared wallet nonce reserved forever after a process restart.
         """
         with private_lock(self.root):
+            # An ordinary proof/PRE call may have mined after its caller lost
+            # the response and stopped visiting that job. Drain its reservation
+            # even when no DKG transaction is currently needed.
+            with _account_transaction_lock(self.nonce_root):
+                recover_regular_transaction(self.w3, self.account.address, self.nonce_root)
             path = self.root / 'outbox.json'
             if path.exists() or path.is_symlink():
                 entry = read_private_json(path)

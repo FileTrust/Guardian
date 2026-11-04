@@ -4,6 +4,7 @@ from pathlib import Path
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 from .g_dkg_attempt_tx import DurableSender, PendingTransaction
+from .g_tx import _account_transaction_lock, recover_regular_transaction
 from .g_dkg_identity import read_private_json
 from .g_heartbeat import heartbeat_tick
 from .g_secret_files import read_secret_json
@@ -18,6 +19,11 @@ def recover_pending_transactions(w3, cfg, root, stop, log=lambda _: None):
     reported = None
     while not stop.is_set():
         try:
+            regular = root / 'state/regular_transactions/outbox.json'
+            if regular.exists() or regular.is_symlink():
+                account = w3.eth.account.from_key(cfg['private_key'])
+                with _account_transaction_lock(root):
+                    recover_regular_transaction(w3, account.address, root)
             if (heartbeat.exists() or heartbeat.is_symlink()) and read_secret_json(heartbeat):
                 # A saved envelope is the only reason to tick here. Startup
                 # never creates a new heartbeat before registration.
