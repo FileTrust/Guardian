@@ -45,9 +45,11 @@ class AttemptWorker:
     No import-time wallet/config reads and no implied acceptance defaults.
     """
     def __init__(self, w3, address, contracts, root, limits, profiles, submit, share_path, *, stop_requested=lambda: False,
-                 observe=lambda event: None, work_threads=2):
+                 observe=lambda event: None, work_threads=2, publication_transactions_per_turn=3):
         if type(work_threads) is not int or not 1 <= work_threads <= 4:
             raise ValueError('Guardian work threads must be between one and four')
+        if type(publication_transactions_per_turn) is not int or not 1 <= publication_transactions_per_turn <= 4:
+            raise ValueError('Guardian publication transactions per turn must be between one and four')
         self.w3, self.address, self.c = w3, Web3.to_checksum_address(address), contracts
         self.root, self.limits, self.profiles = Path(root), limits, profiles
         self.submit, self.share_path = submit, share_path
@@ -58,6 +60,7 @@ class AttemptWorker:
         self._terminal_registry_ids = set()
         self._finality_anchor = None
         self.work_threads = work_threads
+        self.publication_transactions_per_turn = publication_transactions_per_turn
         self._observation_lock = threading.Lock()
 
     def _observe(self, mat, phase, reason, **details):
@@ -246,6 +249,21 @@ class AttemptWorker:
         return batch, local
 
     def _publish(self, mat, j, r, role, context):
+        # Reuse protected material only within this locked processing turn.
+        # Bound the number of confirmed writes so other accepted jobs progress.
+        remaining = getattr(self, 'publication_transactions_per_turn', 3)
+
+        def send(fn, action):
+            nonlocal remaining
+            self._check_stop()
+            attempt = record(self.c.registry.functions.getAttempt(j.registryId))
+            timestamp = self.w3.eth.get_block('latest')['timestamp']
+            if attempt.state != 2 or timestamp > attempt.workDeadline - j.receiverDuration:
+                return False
+            self._send(fn, mat, action)
+            remaining -= 1
+            return True
+
         batch, local = self._material(mat, j, r, role, context)
         compressed = [compress_commitment(point) for point in local.commitments]
         ciphers, indices = [], []
@@ -256,17 +274,19 @@ class AttemptWorker:
             key = tuple(self.c.manager.functions.getReceiverEncryptionKey(mat, guardian).call())
             ciphers.append(encrypt_share(local.shares[index-1], self.identity.secret, key, local.commitments[0]))
             indices.append(index)
-        if batch.exists:
-            expected_hash = Web3.keccak(b''.join(v.to_bytes(32, 'big') for v in compressed))
-            if (batch.dealer.lower() != self.address.lower() or batch.dealerIndex != role.dealerIndex or
-                    bytes(batch.commitmentHash) != expected_hash or list(batch.encryptedShares) != ciphers):
-                raise RuntimeError('Published DKG batch differs from protected local material')
-        else:
+        if not batch.exists:
             fn = (self.c.manager.functions.publishZkDkgBabyJubjubMaterial if r.refresh else
                   self.c.manager.functions.publishAndAcknowledgeV2Material)
-            self._send(fn(mat, r.fileId, r.epoch, r.version, r.refresh, role.dealerIndex,
-                          compressed, ciphers, compressed[0]), mat, 'batch')
-            return False
+            if not send(fn(mat, r.fileId, r.epoch, r.version, r.refresh, role.dealerIndex,
+                           compressed, ciphers, compressed[0]), 'batch') or not remaining:
+                return False
+            batch = record(self.c.manager.functions.getMaterialBatch(
+                mat, r.epoch, r.version, r.refresh, role.dealerIndex))
+        expected_hash = Web3.keccak(b''.join(v.to_bytes(32, 'big') for v in compressed))
+        if (not batch.exists or batch.dealer.lower() != self.address.lower() or
+                batch.dealerIndex != role.dealerIndex or bytes(batch.commitmentHash) != expected_hash or
+                list(batch.encryptedShares) != ciphers):
+            raise RuntimeError('Published DKG batch differs from protected local material')
         existing = self.c.coordinator.functions.getV2DealerCommitments(
             r.fileId, r.epoch, r.version, role.dealerIndex).call()
         xs, ys = [p[0] for p in local.commitments], [p[1] for p in local.commitments]
@@ -274,9 +294,14 @@ class AttemptWorker:
             if existing[1].lower() != self.address.lower() or list(existing[3]) != xs or list(existing[4]) != ys:
                 raise RuntimeError('Published DKG commitments differ from protected material')
         else:
-            self._send(self.c.coordinator.functions.publishV2DealerCommitmentsForAttempt(
-                mat, r.fileId, r.epoch, r.version, role.dealerIndex, xs, ys), mat, 'commitments')
-            return False
+            if not send(self.c.coordinator.functions.publishV2DealerCommitmentsForAttempt(
+                    mat, r.fileId, r.epoch, r.version, role.dealerIndex, xs, ys), 'commitments') or not remaining:
+                return False
+            existing = self.c.coordinator.functions.getV2DealerCommitments(
+                r.fileId, r.epoch, r.version, role.dealerIndex).call()
+            if (not existing[0] or existing[1].lower() != self.address.lower() or
+                    list(existing[3]) != xs or list(existing[4]) != ys):
+                raise RuntimeError('Published DKG commitments differ from protected material')
         for index, ciphertext in zip(indices, ciphers):
             self._check_stop()
             existing = self.c.coordinator.functions.getV2EncryptedShare(
@@ -287,10 +312,10 @@ class AttemptWorker:
                         bytes(existing[3]) != scalar_payload(ciphertext)):
                     raise RuntimeError('Published DKG ciphertext differs from protected material')
             else:
-                self._send(self.c.coordinator.functions.publishV2EncryptedShareForAttempt(
+                if not send(self.c.coordinator.functions.publishV2EncryptedShareForAttempt(
                     mat, r.fileId, r.epoch, r.version, role.dealerIndex, index, scalar_payload(ciphertext)),
-                    mat, f'cipher-{index}')
-                return False
+                        f'cipher-{index}') or not remaining:
+                    return False
         return True
 
     def _complain(self, mat, r, dealer, receiver):
@@ -568,6 +593,7 @@ def _initialize_worker(cfg, w3, account, stop_requested):
     worker = AttemptWorker(w3, account.address, c, root, limits, profiles, sender, v2_final_share_path,
         stop_requested=stop_requested,
         work_threads=settings.get('work_threads', 2),
+        publication_transactions_per_turn=settings.get('publication_transactions_per_turn', 3),
         observe=lambda event: print('DKG duty status '+json.dumps(event, sort_keys=True), flush=True))
     sender.recover()
     worker.start()
