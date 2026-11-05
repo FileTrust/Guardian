@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import random
+import json
 
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
@@ -41,12 +42,72 @@ class AttemptWorker:
     wallet outbox. share_path(file,epoch,version,n,t,index) locates active custody.
     No import-time wallet/config reads and no implied acceptance defaults.
     """
-    def __init__(self, w3, address, contracts, root, limits, profiles, submit, share_path, *, stop_requested=lambda: False):
+    def __init__(self, w3, address, contracts, root, limits, profiles, submit, share_path, *, stop_requested=lambda: False,
+                 observe=lambda event: None):
         self.w3, self.address, self.c = w3, Web3.to_checksum_address(address), contracts
         self.root, self.limits, self.profiles = Path(root), limits, profiles
         self.submit, self.share_path = submit, share_path
         self.stop_requested = stop_requested
         self.identity = None
+        self.observe = observe
+        self._observations = {}
+        self._terminal_registry_ids = set()
+        self._finality_anchor = None
+
+    def _observe(self, mat, phase, reason, **details):
+        """Public obligation identifiers/reasons only; no transaction payloads."""
+        key = hex32(mat)
+        state = (phase, reason)
+        if self._observations.get(key) == state:
+            return
+        if len(self._observations) >= 2048:
+            self._observations.pop(next(iter(self._observations)))
+        self._observations[key] = state
+        self.observe(dict(material_id=key, phase=phase, reason=reason, **details))
+
+    def _active_count(self, catalog, mat, *, read_limit=32):
+        """Count live duties; cache only terminal state verified at finality.
+
+        No cached stake, wallet balance, pending acceptance or fee is used.
+        An unsupported finality tag falls back to fresh authoritative reads.
+        A changed/rewound anchor invalidates all terminal-state shortcuts.
+        """
+        if type(read_limit) is not int or not 1 <= read_limit <= 64:
+            raise ValueError('Admission inventory read budget must be between one and 64')
+        finalized = None
+        try:
+            head = self.w3.eth.get_block('finalized')
+            height, digest = int(head['number']), Web3.to_hex(head['hash'])
+            old = self._finality_anchor
+            if old and (height < old[0] or Web3.to_hex(
+                    self.w3.eth.get_block(old[0])['hash']) != old[1]):
+                self._terminal_registry_ids.clear()
+            self._finality_anchor = (height, digest)
+            finalized = height
+        except Exception:
+            self._terminal_registry_ids.clear()
+            self._finality_anchor = None
+        count, reads = 0, 0
+        for key, entry in catalog.items():
+            if key == hex32(mat) or entry['registry_id'] in self._terminal_registry_ids:
+                continue
+            if reads >= read_limit:
+                return None  # Next pass retains finalized inventory progress.
+            reads += 1
+            fn = self.c.registry.functions.getAttempt(entry['registry_id'])
+            previous = record(fn)
+            if previous.state not in (1, 2):
+                if finalized is not None:
+                    values = fn.call(block_identifier=finalized)
+                    fields = fn.abi['outputs'][0]['components']
+                    terminal = dict(zip((f['name'] for f in fields), values))
+                    if int(terminal['state']) >= 3:
+                        self._terminal_registry_ids.add(entry['registry_id'])
+                continue
+            accepted = record(self.c.registry.functions.getDuty(entry['registry_id'], self.address)).accepted
+            if accepted or entry['reserved']:
+                count += 1
+        return count
 
     def start(self):
         self.identity = ensure_registered_identity(self.root, self.address, self.c.guardians,
@@ -108,14 +169,20 @@ class AttemptWorker:
 
     def _accept(self, mat, j, r, role, a, duty):
         if not self.limits.enabled:
+            self._observe(mat, 'declined', 'acceptance_disabled')
             return False
         # Serializes local consent across different jobs, not just one mat ID.
         with private_lock(self.root / 'acceptance'):
             a = record(self.c.registry.functions.getAttempt(j.registryId))
             duty = record(self.c.registry.functions.getDuty(j.registryId, self.address))
-            if duty.accepted or a.state != 1 or self.w3.eth.get_block('latest')['timestamp'] > a.acceptBy:
+            if duty.accepted:
+                self._observe(mat, 'accepted', 'confirmed_existing_acceptance')
+                return False
+            if a.state != 1 or self.w3.eth.get_block('latest')['timestamp'] > a.acceptBy:
+                self._observe(mat, 'closed', 'acceptance_window_closed')
                 return False
             if not self.c.guardians.functions.isActiveGuardian(self.address).call():
+                self._observe(mat, 'declined', 'guardian_not_active')
                 return False
             original = tuple(self.c.manager.functions.getEncryptionKey(mat, self.address).call())
             derived = tuple(self.c.manager.functions.getReceiverEncryptionKey(mat, self.address).call())
@@ -132,12 +199,10 @@ class AttemptWorker:
                             - stake.minimumGuardianStake().call())
             with private_lock(self.root / 'catalog'):
                 catalog = self._catalog()
-                active = 0
-                for key, entry in catalog.items():
-                    previous = record(self.c.registry.functions.getAttempt(entry['registry_id']))
-                    accepted = record(self.c.registry.functions.getDuty(entry['registry_id'], self.address)).accepted
-                    if key != hex32(mat) and previous.state in (1, 2) and (accepted or entry['reserved']):
-                        active += 1
+                active = self._active_count(catalog, mat)
+                if active is None:
+                    self._observe(mat, 'deferred', 'admission_inventory_refresh_pending')
+                    return False
                 fn = self.c.registry.functions.accept(j.registryId)
                 # A plain test sender can supply a quote; production always
                 # uses the actual durable sender's bounded simulation/quote.
@@ -149,10 +214,12 @@ class AttemptWorker:
                     available_stake_wei=available, wallet_fee_balance_wei=self.w3.eth.get_balance(self.address),
                     estimated_acceptance_cost_wei=gas * price, profile_verified=True)
                 if not allowed:
+                    self._observe(mat, 'declined', reason, active_attempts=active)
                     return False
                 catalog[hex32(mat)]['reserved'] = True
                 write_json_atomic(self.root / 'catalog/jobs.json', catalog)
             self._send(fn, mat, 'accept')
+            self._observe(mat, 'accepted', 'acceptance_confirmed', n=j.receiverCount, t=j.threshold)
             return True
 
     def _material(self, mat, j, r, role, context):
@@ -185,6 +252,7 @@ class AttemptWorker:
                   self.c.manager.functions.publishAndAcknowledgeV2Material)
             self._send(fn(mat, r.fileId, r.epoch, r.version, r.refresh, role.dealerIndex,
                           compressed, ciphers, compressed[0]), mat, 'batch')
+            return False
         existing = self.c.coordinator.functions.getV2DealerCommitments(
             r.fileId, r.epoch, r.version, role.dealerIndex).call()
         xs, ys = [p[0] for p in local.commitments], [p[1] for p in local.commitments]
@@ -194,6 +262,7 @@ class AttemptWorker:
         else:
             self._send(self.c.coordinator.functions.publishV2DealerCommitmentsForAttempt(
                 mat, r.fileId, r.epoch, r.version, role.dealerIndex, xs, ys), mat, 'commitments')
+            return False
         for index, ciphertext in zip(indices, ciphers):
             self._check_stop()
             existing = self.c.coordinator.functions.getV2EncryptedShare(
@@ -207,6 +276,8 @@ class AttemptWorker:
                 self._send(self.c.coordinator.functions.publishV2EncryptedShareForAttempt(
                     mat, r.fileId, r.epoch, r.version, role.dealerIndex, index, scalar_payload(ciphertext)),
                     mat, f'cipher-{index}')
+                return False
+        return True
 
     def _complain(self, mat, r, dealer, receiver):
         functions = self.c.manager.functions
@@ -276,7 +347,7 @@ class AttemptWorker:
                 continue
             if self.w3.eth.get_block('latest')['timestamp'] > dispute.deadline:
                 self._send(functions.finalizeExpiredZkDkgEncryptedShareDispute(dispute_id), mat, f'expire-complaint-{index}')
-                continue
+                return False
             build = self._profile(mat, j)
             _, local = self._material(mat, j, r, role, context)
             from .g_zk import generate_zkdkg_dispute_justification_proof, proof_tuple_from_zokrates_json
@@ -289,6 +360,8 @@ class AttemptWorker:
                 raise RuntimeError('Saved DKG material cannot justify this ciphertext')
             self._send(functions.justifyZkDkgEncryptedShareDispute(dispute_id,
                 proof_tuple_from_zokrates_json(proof)), mat, f'justify-{index}')
+            return False
+        return True
 
     def _activate(self, mat, j, r, role, context):
         key = record(self.c.coordinator.functions.getV2Key(r.fileId))
@@ -339,6 +412,15 @@ class AttemptWorker:
             context = MaterialContext(hex32(mat), hex32(j.contextHash), hex32(j.fileId), j.epoch,
                 j.version, role.dealerIndex or 1, j.receiverCount, j.threshold)
             duty = record(self.c.registry.functions.getDuty(j.registryId, self.address))
+            with private_lock(self.root / 'catalog'):
+                catalog = self._catalog()
+                saved = catalog[hex32(mat)]
+                deadline = a.acceptBy if a.state == 1 else a.workDeadline
+                if (saved.get('deadline') != deadline or
+                        (duty.accepted and not saved.get('accepted'))):
+                    saved['deadline'] = int(deadline)
+                    saved['accepted'] = bool(duty.accepted) or saved.get('accepted', False)
+                    write_json_atomic(self.root / 'catalog/jobs.json', catalog)
             if a.state == 1:
                 return self._accept(mat, j, r, role, a, duty)
             if a.state >= 3:
@@ -352,13 +434,15 @@ class AttemptWorker:
             if a.state != 2 or not duty.accepted:
                 return False
             if role.dealerIndex:
-                self._disputes(mat, j, r, role, context)
+                if self._disputes(mat, j, r, role, context) is False:
+                    return True
             timestamp = self.w3.eth.get_block('latest')['timestamp']
             if timestamp > a.workDeadline:
                 return False  # Owner/settler closes it; G cannot promote it.
             self._profile(mat, j)
             if role.dealerIndex and timestamp <= a.workDeadline-j.receiverDuration:
-                self._publish(mat, j, r, role, context)
+                if self._publish(mat, j, r, role, context) is False:
+                    return True
             if role.receiverIndex and self.c.controller.functions.materialsReady(mat).call():
                 self._receive(mat, j, r, role, context)
             return True
@@ -368,36 +452,65 @@ class AttemptWorker:
         pending = set()
         with private_lock(self.root / 'catalog'):
             jobs = list(self._catalog().items())
-        pending.update(mat for mat, saved in jobs if not saved['done'])
+        committed = {mat for mat, saved in jobs if not saved['done'] and
+                     (saved.get('accepted') or saved.get('reserved'))}
+        offers = [mat for mat, saved in jobs if not saved['done'] and mat not in committed]
+        cursor = getattr(self, '_offer_cursor', 0) % max(1, len(offers))
+        selected = [offers[(cursor+i) % len(offers)] for i in range(min(16, len(offers)))]
+        self._offer_cursor = (cursor + len(selected)) % max(1, len(offers))
+        pending.update(committed)
+        pending.update(selected)
         errors = []
+        discovered = {}
+        event_discovery = getattr(self, '_event_discovery', None)
+        if event_discovery is None and hasattr(self.c.registry, 'events'):
+            from .g_dkg_discovery import OfferDiscovery
+            event_discovery = self._event_discovery = OfferDiscovery(self.w3, self.c, self.root)
         try:
-            count = self.c.acl.functions.getFileCount().call()
-            cursor = getattr(self, '_cursor', 0) % max(1, count)
-            for offset in range(min(page_size, count)):
-                self._check_stop()
-                index = (cursor+offset) % count
-                file_id = self.c.acl.functions.getFileIdAt(index).call()
-                registry_id = self.c.registry.functions.activeAttemptOf(file_id).call()
-                if any(registry_id):
-                    mat = self.c.controller.functions.materialForRegistryId(registry_id).call()
-                    pending.add(hex32(mat))
-                # Preserve discovery progress when a later read is throttled.
-                self._cursor = (index + 1) % count
+            if event_discovery is not None:
+                for identifier, material in event_discovery.discover():
+                    discovered[material] = identifier
+                    pending.add(material)
+            else:
+                # Compatibility for legacy adapters without registry events.
+                count = self.c.acl.functions.getFileCount().call()
+                cursor = getattr(self, '_cursor', 0) % max(1, count)
+                for offset in range(min(page_size, count)):
+                    self._check_stop()
+                    index = (cursor+offset) % count
+                    file_id = self.c.acl.functions.getFileIdAt(index).call()
+                    registry_id = self.c.registry.functions.activeAttemptOf(file_id).call()
+                    if any(registry_id):
+                        mat = self.c.controller.functions.materialForRegistryId(registry_id).call()
+                        pending.add(hex32(mat))
+                    self._cursor = (index + 1) % count
         except (ConnectionError, Timeout, HTTPError) as error:
             errors.append(('discovery', type(error).__name__))
             # Discovery trouble must not withhold already accepted duties.
-        for mat in sorted(pending):
+        acknowledged = []
+        deadlines = {mat: saved.get('deadline', 0) for mat, saved in jobs}
+        for mat in sorted(pending, key=lambda m: (m not in committed, deadlines.get(m, 0), m)):
             self._check_stop()
             try:
                 self.step(mat)
+                if mat in discovered:
+                    acknowledged.append(discovered[mat])
             except Exception as error:
+                self._observe(mat, 'deferred', type(error).__name__)
                 errors.append((mat, type(error).__name__))
+        if event_discovery is not None:
+            event_discovery.acknowledge(acknowledged)
         return errors
 
 
 def _initialize_worker(cfg, w3, account, stop_requested):
     from .g_dkg_attempt_tx import DurableSender
     from .g_material import v2_final_share_path
+    from .g_dkg_rpc import ReadRetryHTTPProvider
+    if isinstance(getattr(w3, 'provider', None), ReadRetryHTTPProvider):
+        # Return uncertainty to the fair job loop rather than monopolizing it
+        # for eight HTTP timeouts. Signed broadcasts use their separate lane.
+        w3.provider.set_read_retry_attempts(cfg.DKG_RECOVERY.get('rpc_read_attempts', 3))
     c = RecoveryContracts(w3, cfg.ZKDKG_COORDINATOR_V2_ADDRESS, cfg.ACL_ADDRESS,
                           cfg.GUARDIAN_REGISTRY_ADDRESS, cfg.STAKING_MANAGER_ADDRESS)
     settings = cfg.DKG_RECOVERY
@@ -412,7 +525,8 @@ def _initialize_worker(cfg, w3, account, stop_requested):
         max_gas=int(settings.get('max_transaction_gas', 10_000_000)),
         max_gas_price_wei=int(settings['max_gas_price_wei']))
     worker = AttemptWorker(w3, account.address, c, root, limits, profiles, sender, v2_final_share_path,
-                           stop_requested=stop_requested)
+        stop_requested=stop_requested,
+        observe=lambda event: print('DKG duty status '+json.dumps(event, sort_keys=True), flush=True))
     sender.recover()
     worker.start()
     return worker, sender

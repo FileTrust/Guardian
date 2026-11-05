@@ -13,19 +13,25 @@ class ReadRetryHTTPProvider(HTTPProvider):
     Broadcasts retain the transaction coordinator's identical-byte handling.
     RPC contract errors and valid null results pass through unchanged.
     """
+    def set_read_retry_attempts(self, attempts):
+        if type(attempts) is not int or not 1 <= attempts <= 8:
+            raise ValueError('DKG read retries must be between one and eight')
+        self._read_retry_attempts = attempts
+
     def make_request(self, method, params):
         if str(method) in ('eth_sendRawTransaction', 'eth_sendTransaction'):
             return super().make_request(method, params)
         from requests.exceptions import ConnectionError, HTTPError, Timeout
         from .g_lifecycle import STOP
-        for attempt in range(8):
+        attempts = getattr(self, '_read_retry_attempts', 8)
+        for attempt in range(attempts):
             try:
                 return super().make_request(method, params)
             except (ConnectionError, HTTPError, Timeout) as error:
                 if isinstance(error, HTTPError) and (error.response is None or
                         error.response.status_code != 429 and error.response.status_code < 500):
                     raise
-                if attempt == 7 or STOP.wait(min(8, 0.5 * 2**attempt)):
+                if attempt == attempts - 1 or STOP.wait(min(8, 0.5 * 2**attempt)):
                     raise
 
 
