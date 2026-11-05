@@ -90,9 +90,31 @@ def install_read_pacing(w3, interval, stop, *, clock=time.monotonic, minimum_int
     if not interval:
         return
     if minimum_interval is not None:
-        if not isinstance(getattr(w3, 'provider', None), ReadRetryHTTPProvider):
-            raise ValueError('Adaptive pacing requires the bounded read provider')
-        w3.provider._read_budget = ReadBudget(interval, minimum_interval, stop, clock)
+        budget = ReadBudget(interval, minimum_interval, stop, clock)
+        if isinstance(getattr(w3, 'provider', None), ReadRetryHTTPProvider):
+            w3.provider._read_budget = budget
+            return
+        # The DKG entry point also supports Web3's ordinary HTTPProvider.
+        # Wrap its existing transport rather than replacing TLS/session/auth
+        # settings. Errors propagate unchanged, never become empty evidence.
+        class AdaptiveReads(Web3Middleware):
+            def wrap_make_request(self, make_request):
+                def request(method, params):
+                    if str(method) in ('eth_sendRawTransaction', 'eth_sendTransaction'):
+                        return make_request(method, params)
+                    from requests.exceptions import ConnectionError, HTTPError, Timeout
+                    budget.before()
+                    try:
+                        result = make_request(method, params)
+                    except (ConnectionError, HTTPError, Timeout) as error:
+                        if not isinstance(error, HTTPError) or (error.response is not None and
+                                (error.response.status_code == 429 or error.response.status_code >= 500)):
+                            budget.failure()
+                        raise
+                    budget.success()
+                    return result
+                return request
+        w3.middleware_onion.add(AdaptiveReads, name='dkg-adaptive-read-pacing')
         return
 
     class PacedReads(Web3Middleware):
