@@ -31,12 +31,12 @@ class ReadBudget:
                 raise ConnectionError('Guardian read cancelled for shutdown')
             self.next_read = self.clock()+self.interval*units
 
-    def success(self):
+    def success(self, units=1):
         with self.lock:
-            self.successes += 1
+            self.successes += units
             if self.successes >= 32:
                 self.interval = max(self.minimum, self.interval*0.8)
-                self.successes = 0
+                self.successes %= 32
 
     def failure(self):
         with self.lock:
@@ -83,7 +83,7 @@ class ReadRetryHTTPProvider(HTTPProvider):
                     budget.before(units)
                 result = operation()
                 if budget is not None:
-                    budget.success()
+                    budget.success(units)
                 return result
             except (ConnectionError, HTTPError, Timeout) as error:
                 if isinstance(error, HTTPError) and (error.response is None or
