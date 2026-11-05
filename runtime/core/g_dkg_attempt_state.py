@@ -125,6 +125,29 @@ def stage_share(root: Path, context: MaterialContext, index: int, share: int, co
     return path
 
 
+def candidate_public_point(root: Path, context: MaterialContext, index: int, contributors):
+    """Validate durable custody before treating its acknowledgement as done."""
+    path = attempt_directory(root, context.material_id) / f'candidate-{index}.json'
+    if not (path.exists() or path.is_symlink()):
+        return None  # Full reconstruction can safely restore a missing candidate.
+    with private_lock(path.parent):
+        candidate = read_private_json(path)
+    if (candidate.get('context') != asdict(context) or candidate.get('index') != index or
+            candidate.get('materialId') != context.material_id or candidate.get('fileId') != context.file_id or
+            candidate.get('keyEpoch') != context.epoch or candidate.get('shareVersion') != context.version or
+            candidate.get('n') != context.n or candidate.get('t') != context.t or
+            candidate.get('computedFromOldIndices') != list(contributors)):
+        raise RuntimeError('Candidate share differs from the accepted duty context')
+    try:
+        share = int(candidate['share'])
+        point = (int(candidate['vkx']), int(candidate['vky']))
+        if not 0 < share < BABY_L or int(candidate['sk']) != share or baby_mul(share) != point:
+            raise ValueError()
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError('Candidate share failed custody validation') from None
+    return point
+
+
 def activate_share(root: Path, context: MaterialContext, index: int, destination: Path, *, active_material_id):
     if material_id_bytes(active_material_id) != material_id_bytes(context.material_id):
         raise RuntimeError('Candidate attempt is not the active on-chain share version')

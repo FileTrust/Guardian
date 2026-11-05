@@ -1,5 +1,6 @@
 """Optional read pacing for a development fleet sharing a bounded RPC gateway."""
 import math
+import json
 import threading
 import time
 
@@ -22,13 +23,13 @@ class ReadBudget:
         self.next_read = 0
         self.successes = 0
 
-    def before(self):
+    def before(self, units=1):
         from requests.exceptions import ConnectionError
         with self.lock:
             delay = max(0, self.next_read-self.clock())
             if delay and self.stop.wait(delay):
                 raise ConnectionError('Guardian read cancelled for shutdown')
-            self.next_read = self.clock()+self.interval
+            self.next_read = self.clock()+self.interval*units
 
     def success(self):
         with self.lock:
@@ -44,12 +45,22 @@ class ReadBudget:
             self.next_read = max(self.next_read, self.clock()+self.interval)
 
 
+class ReadBatchUnavailable(RuntimeError):
+    """The endpoint explicitly does not implement JSON-RPC batches."""
+
+
 class ReadRetryHTTPProvider(HTTPProvider):
     """Retry transient HTTP failures for reads, including gas estimation.
 
     Broadcasts retain the transaction coordinator's identical-byte handling.
     RPC contract errors and valid null results pass through unchanged.
     """
+    def __init__(self, *args, **kwargs):
+        # One retry layer only; do not multiply our limit by Web3's retries.
+        kwargs['exception_retry_configuration'] = None
+        kwargs['request_kwargs'] = {'timeout': (5, 15), **(kwargs.get('request_kwargs') or {})}
+        super().__init__(*args, **kwargs)
+
     def set_read_retry_attempts(self, attempts):
         if type(attempts) is not int or not 1 <= attempts <= 8:
             raise ValueError('DKG read retries must be between one and eight')
@@ -58,6 +69,10 @@ class ReadRetryHTTPProvider(HTTPProvider):
     def make_request(self, method, params):
         if str(method) in ('eth_sendRawTransaction', 'eth_sendTransaction'):
             return super().make_request(method, params)
+        parent = super().make_request
+        return self._retry_read(lambda: parent(method, params))
+
+    def _retry_read(self, operation, units=1):
         from requests.exceptions import ConnectionError, HTTPError, Timeout
         from .g_lifecycle import STOP
         attempts = getattr(self, '_read_retry_attempts', 8)
@@ -65,8 +80,8 @@ class ReadRetryHTTPProvider(HTTPProvider):
         for attempt in range(attempts):
             try:
                 if budget is not None:
-                    budget.before()
-                result = super().make_request(method, params)
+                    budget.before(units)
+                result = operation()
                 if budget is not None:
                     budget.success()
                 return result
@@ -78,6 +93,34 @@ class ReadRetryHTTPProvider(HTTPProvider):
                     budget.failure()
                 if attempt == attempts - 1 or STOP.wait(min(8, 0.5 * 2**attempt)):
                     raise
+
+    def verified_read_batch(self, requests):
+        """Read-only batch with exact ID matching using this TLS/session setup."""
+        if not requests or len(requests) > 16 or any(method != 'eth_call' for method, _ in requests):
+            raise ValueError('DKG batches permit at most sixteen contract reads')
+        encoded = self.encode_batch_rpc_request(requests)
+        identifiers = [r['id'] for r in json.loads(encoded)]
+
+        def request():
+            raw = self._request_session_manager.make_post_request(
+                self.endpoint_uri, encoded, **self.get_request_kwargs())
+            response = self.decode_rpc_response(raw)
+            if (isinstance(response, dict) and 'result' not in response and
+                    isinstance(response.get('error'), dict) and
+                    response['error'].get('code') in (-32600, -32601)):
+                raise ReadBatchUnavailable('RPC endpoint does not support read batches')
+            if not isinstance(response, list) or len(response) != len(identifiers):
+                raise RuntimeError('DKG batch response is incomplete')
+            by_id = {}
+            for item in response:
+                if (not isinstance(item, dict) or type(item.get('id')) is not int or
+                        item.get('jsonrpc') != '2.0' or
+                        item['id'] in by_id or item['id'] not in identifiers or
+                        'error' in item or not isinstance(item.get('result'), str)):
+                    raise RuntimeError('DKG batch response is invalid')
+                by_id[item['id']] = item['result']
+            return [by_id[i] for i in identifiers]
+        return self._retry_read(request, len(requests))
 
 
 def install_read_pacing(w3, interval, stop, *, clock=time.monotonic, minimum_interval=None):

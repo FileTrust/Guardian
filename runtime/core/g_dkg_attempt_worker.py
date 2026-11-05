@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import random
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
@@ -20,12 +21,13 @@ from web3 import Web3
 from .g_crypto import BABY_L, baby_mul, verify_v2_share_against_commitments
 from .g_dkg_acceptance import AcceptanceLimits, DutyOffer, acceptance_decision
 from .g_dkg_attempt_state import (MaterialContext, activate_share, attempt_directory,
-                                  load_dealer_material, stage_share)
+                                  load_dealer_material, stage_share, candidate_public_point)
 from .g_dkg_cipher import (compress_commitment, decrypt_share, encrypt_share,
                            material_id_bytes, read_scalar_payload, receiver_public_key,
                            receiver_secret_key, scalar_payload)
 from .g_dkg_identity import ensure_registered_identity, private_lock, read_private_json
 from .g_dkg_recovery_contracts import PinnedProfiles, RecoveryContracts, record
+from .g_dkg_reads import read_records, read_contracts
 from .g_secret_files import write_json_atomic
 
 
@@ -45,11 +47,14 @@ class AttemptWorker:
     No import-time wallet/config reads and no implied acceptance defaults.
     """
     def __init__(self, w3, address, contracts, root, limits, profiles, submit, share_path, *, stop_requested=lambda: False,
-                 observe=lambda event: None, work_threads=2, publication_transactions_per_turn=3):
+                 observe=lambda event: None, work_threads=2, publication_transactions_per_turn=3,
+                 expected_chain_id=None):
         if type(work_threads) is not int or not 1 <= work_threads <= 4:
             raise ValueError('Guardian work threads must be between one and four')
         if type(publication_transactions_per_turn) is not int or not 1 <= publication_transactions_per_turn <= 4:
             raise ValueError('Guardian publication transactions per turn must be between one and four')
+        if expected_chain_id is not None and (type(expected_chain_id) is not int or expected_chain_id <= 0):
+            raise ValueError('Guardian chain ID must be a positive integer')
         self.w3, self.address, self.c = w3, Web3.to_checksum_address(address), contracts
         self.root, self.limits, self.profiles = Path(root), limits, profiles
         self.submit, self.share_path = submit, share_path
@@ -61,7 +66,12 @@ class AttemptWorker:
         self._finality_anchor = None
         self.work_threads = work_threads
         self.publication_transactions_per_turn = publication_transactions_per_turn
+        self.expected_chain_id = expected_chain_id
         self._observation_lock = threading.Lock()
+        self._completed_event = threading.Event()
+        self._publication_progress = set()
+        self._discovery_acks = []
+        self._discovery_ack_lock = threading.Lock()
 
     def _observe(self, mat, phase, reason, **details):
         """Public obligation identifiers/reasons only; no transaction payloads."""
@@ -104,13 +114,20 @@ class AttemptWorker:
         except Exception:
             self._terminal_registry_ids.clear()
             self._finality_anchor = None
-        count, reads = 0, 0
-        for key, entry in catalog.items():
-            if key == hex32(mat) or entry['registry_id'] in self._terminal_registry_ids:
+        pending = [(key, entry) for key, entry in catalog.items()
+                   if key != hex32(mat) and entry['registry_id'] not in self._terminal_registry_ids]
+        page = pending[:read_limit]
+        # A local done flag is a query hint, never evidence of completion.
+        # Verify those records together against one finalized chain snapshot.
+        historical = [entry for _, entry in page if entry.get('done') and finalized is not None]
+        functions = [self.c.registry.functions.getAttempt(entry['registry_id']) for entry in historical]
+        values = read_records(self.w3, functions, block_identifier=finalized,
+                              expected_chain_id=getattr(self, 'expected_chain_id', None))
+        verified = {entry['registry_id'] for entry, value in zip(historical, values) if value.state >= 3}
+        count = 0
+        for key, entry in page:
+            if entry['registry_id'] in verified:
                 continue
-            if reads >= read_limit:
-                return None  # Next pass retains finalized inventory progress.
-            reads += 1
             fn = self.c.registry.functions.getAttempt(entry['registry_id'])
             previous = record(fn)
             if previous.state not in (1, 2):
@@ -119,12 +136,18 @@ class AttemptWorker:
                     fields = fn.abi['outputs'][0]['components']
                     terminal = dict(zip((f['name'] for f in fields), values))
                     if int(terminal['state']) >= 3:
-                        self._terminal_registry_ids.add(entry['registry_id'])
+                        verified.add(entry['registry_id'])
                 continue
             accepted = record(self.c.registry.functions.getDuty(entry['registry_id'], self.address)).accepted
             if accepted or entry['reserved']:
                 count += 1
-        return count
+        if finalized is not None:
+            if Web3.to_hex(self.w3.eth.get_block(finalized)['hash']) != digest:
+                self._terminal_registry_ids.clear()
+                self._finality_anchor = None
+                return None
+            self._terminal_registry_ids.update(verified)
+        return None if len(pending) > read_limit else count
 
     def start(self):
         self.identity = ensure_registered_identity(self.root, self.address, self.c.guardians,
@@ -135,6 +158,9 @@ class AttemptWorker:
         receipt = self.submit(fn, f'{hex32(material)}:{action}')
         if receipt is None or int(receipt['status']) != 1:
             raise RuntimeError('Accepted DKG work was not confirmed')
+        progress = getattr(self, '_publication_progress', None)
+        if progress is not None:
+            progress.add(hex32(material))
         return receipt
 
     def _check_stop(self):
@@ -210,29 +236,31 @@ class AttemptWorker:
                 self.profiles.proof_binary()
             if r.refresh and role.dealerIndex:
                 self._old_share(r, role.dealerIndex)
+            with private_lock(self.root / 'catalog'):
+                catalog = self._catalog()
+            # Consent stays serialized, but unrelated jobs can read/update the
+            # catalog while this bounded historical inventory is refreshed.
+            active = self._active_count(catalog, mat)
+            if active is None:
+                self._observe(mat, 'deferred', 'admission_inventory_refresh_pending')
+                return False
             fees = record(self.c.escrow.functions.getFees(j.registryId, self.address))
             stake = self.c.staking.functions
             available = max(0, stake.stakeOf(self.address).call() - stake.lockedStakeOf(self.address).call()
                             - stake.minimumGuardianStake().call())
+            fn = self.c.registry.functions.accept(j.registryId)
+            gas, price = self.submit.gas_quote(fn)
+            offer = DutyOffer(j.receiverCount, j.threshold, bool(role.dealerIndex), bool(role.receiverIndex),
+                duty.bond, fees.acceptance, fees.material, fees.shareKey, j.dealerDuration, j.receiverDuration,j.disputeDuration)
+            allowed, reason = acceptance_decision(self.limits, offer,
+                installed_profiles=set(self.profiles.profiles), active_attempts=active,
+                available_stake_wei=available, wallet_fee_balance_wei=self.w3.eth.get_balance(self.address),
+                estimated_acceptance_cost_wei=gas * price, profile_verified=True)
+            if not allowed:
+                self._observe(mat, 'declined', reason, active_attempts=active)
+                return False
             with private_lock(self.root / 'catalog'):
                 catalog = self._catalog()
-                active = self._active_count(catalog, mat)
-                if active is None:
-                    self._observe(mat, 'deferred', 'admission_inventory_refresh_pending')
-                    return False
-                fn = self.c.registry.functions.accept(j.registryId)
-                # A plain test sender can supply a quote; production always
-                # uses the actual durable sender's bounded simulation/quote.
-                gas, price = self.submit.gas_quote(fn)
-                offer = DutyOffer(j.receiverCount, j.threshold, bool(role.dealerIndex), bool(role.receiverIndex),
-                    duty.bond, fees.acceptance, fees.material, fees.shareKey, j.dealerDuration, j.receiverDuration,j.disputeDuration)
-                allowed, reason = acceptance_decision(self.limits, offer,
-                    installed_profiles=set(self.profiles.profiles), active_attempts=active,
-                    available_stake_wei=available, wallet_fee_balance_wei=self.w3.eth.get_balance(self.address),
-                    estimated_acceptance_cost_wei=gas * price, profile_verified=True)
-                if not allowed:
-                    self._observe(mat, 'declined', reason, active_attempts=active)
-                    return False
                 catalog[hex32(mat)]['reserved'] = True
                 write_json_atomic(self.root / 'catalog/jobs.json', catalog)
             self._send(fn, mat, 'accept')
@@ -329,6 +357,18 @@ class AttemptWorker:
         index = role.receiverIndex
         if self.c.manager.functions.pendingReceiverDisputes(mat, self.address).call():
             return
+        candidate = candidate_public_point(self.root, context, index, sorted(r.dealerIndices))
+        if candidate is not None:
+            public, active, expected = read_contracts(self.w3, [
+                self.c.coordinator.functions.getV2SharePublicKeyFull(r.fileId, r.epoch, r.version, index),
+                self.c.coordinator.functions.getMaterialAttemptId(r.fileId, r.epoch, r.version),
+                self.c.book.functions.expectedShare(mat, index)],
+                expected_chain_id=getattr(self, 'expected_chain_id', None))
+            if public[0]:
+                if (bytes(active) != mat or public[1].lower() != self.address.lower() or
+                        tuple(public[2:]) != candidate or tuple(expected) != candidate):
+                    raise RuntimeError('Acknowledged DKG share differs from protected candidate')
+                return  # Fresh matching on-chain evidence, not an in-memory done flag.
         total = 0
         for dealer_index in r.dealerIndices:
             self._check_stop()
@@ -498,6 +538,10 @@ class AttemptWorker:
 
     def scan(self, *, page_size=4):
         """Bounded round-robin discovery plus durable accepted-duty recovery."""
+        errors = self._drain_completed()
+        threads = getattr(self, 'work_threads', 1)
+        if len(getattr(self, '_futures', {})) >= threads:
+            return errors  # Accepted jobs keep running; do not flood discovery.
         pending = set()
         with private_lock(self.root / 'catalog'):
             jobs = list(self._catalog().items())
@@ -509,7 +553,6 @@ class AttemptWorker:
         self._offer_cursor = (cursor + len(selected)) % max(1, len(offers))
         pending.update(committed)
         pending.update(selected)
-        errors = []
         discovered = {}
         event_discovery = getattr(self, '_event_discovery', None)
         if event_discovery is None and hasattr(self.c.registry, 'events'):
@@ -517,7 +560,8 @@ class AttemptWorker:
             event_discovery = self._event_discovery = OfferDiscovery(self.w3, self.c, self.root)
         try:
             if event_discovery is not None:
-                for identifier, material in event_discovery.discover():
+                hints = self._async_discover(event_discovery) if threads > 1 else event_discovery.discover()
+                for identifier, material in hints:
                     discovered[material] = identifier
                     pending.add(material)
             else:
@@ -533,12 +577,16 @@ class AttemptWorker:
                         mat = self.c.controller.functions.materialForRegistryId(registry_id).call()
                         pending.add(hex32(mat))
                     self._cursor = (index + 1) % count
-        except (ConnectionError, Timeout, HTTPError) as error:
+        except (ConnectionError, Timeout, HTTPError, RuntimeError) as error:
             errors.append(('discovery', type(error).__name__))
             # Discovery trouble must not withhold already accepted duties.
         acknowledged = []
         deadlines = {mat: saved.get('deadline', 0) for mat, saved in jobs}
         ordered = sorted(pending, key=lambda m: (m not in committed, deadlines.get(m, 0), m))
+        due = getattr(self, '_next_due', {})
+        self._next_due = {mat: when for mat, when in due.items() if mat in pending}
+        ordered = [mat for mat in ordered if mat not in getattr(self, '_futures', {}) and
+                   self._next_due.get(mat, 0) <= time.monotonic()]
         def process(mat):
             self._check_stop()
             try:
@@ -549,24 +597,126 @@ class AttemptWorker:
             except Exception as error:
                 self._observe(mat, 'deferred', type(error).__name__)
                 return mat, type(error).__name__
-        # Independent jobs overlap their public reads and preparation. The
-        # per-material locks, consent/catalog locks and durable sender's
-        # wallet-wide outbox/nonce locks remain the sole write authorities.
-        threads = getattr(self, 'work_threads', 1)
+        # Keep bounded workers across turns. One slow read no longer holds the
+        # entire scan barrier; a free worker can advance other funded duties.
         def collect(results):
             for mat, error in results:
                 if error is not None:
                     errors.append((mat, error))
                 elif mat in discovered:
                     acknowledged.append(discovered[mat])
-        if threads > 1 and len(ordered) > 1:
-            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix='guardian-duty') as executor:
-                collect(executor.map(process, ordered))
+        if threads > 1:
+            if not hasattr(self, '_executor'):
+                self._executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix='guardian-duty')
+                self._futures, self._discovered_pending = {}, {}
+                if not hasattr(self, '_completed_event'):
+                    self._completed_event = threading.Event()
+            self._completed_event.clear()
+            self._discovered_pending.update(discovered)
+            for mat in ordered[:max(0, threads-len(self._futures))]:
+                self._next_due.pop(mat, None)
+                future = self._executor.submit(process, mat)
+                self._futures[mat] = future
+                future.add_done_callback(lambda _: self._completed_event.set())
+            if self._futures:
+                wait(list(self._futures.values()), timeout=0.05)
+                errors.extend(self._drain_completed())
         else:
             collect(map(process, ordered))
         if event_discovery is not None:
             event_discovery.acknowledge(acknowledged)
         return errors
+
+    def _drain_completed(self):
+        errors, acknowledged = [], []
+        for mat, future in list(getattr(self, '_futures', {}).items()):
+            if not future.done():
+                continue
+            del self._futures[mat]
+            _, error = future.result()
+            progressed = mat in self._publication_progress
+            self._publication_progress.discard(mat)
+            self._next_due[mat] = time.monotonic() + (1 if progressed and error is None else 5)
+            if error is not None:
+                errors.append((mat, error))
+            else:
+                identifier = self._discovered_pending.pop(mat, None)
+                if identifier is not None:
+                    acknowledged.append(identifier)
+        discovery = getattr(self, '_event_discovery', None)
+        if acknowledged and discovery is not None:
+            with self._discovery_ack_lock:
+                self._discovery_acks.extend(acknowledged)
+        return errors
+
+    def _async_discover(self, discovery):
+        found = []
+        future = getattr(self, '_discovery_future', None)
+        if future is not None:
+            if not future.done():
+                return found
+            self._discovery_future = None
+            self._discovery_after = time.monotonic()+5
+            found = future.result()
+        if time.monotonic() >= getattr(self, '_discovery_after', 0):
+            if not hasattr(self, '_discovery_executor'):
+                self._discovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='guardian-discovery')
+            def refresh():
+                with self._discovery_ack_lock:
+                    acknowledged = self._discovery_acks[:]
+                    self._discovery_acks.clear()
+                try:
+                    if acknowledged:
+                        discovery.acknowledge(acknowledged)
+                except Exception:
+                    with self._discovery_ack_lock:
+                        self._discovery_acks.extend(acknowledged)
+                    raise
+                return discovery.discover()
+            self._discovery_future = self._discovery_executor.submit(refresh)
+            self._discovery_future.add_done_callback(lambda _: self._completed_event.set())
+        return found
+
+    def wait_for_work(self, stop, maximum):
+        delay = maximum
+        if getattr(self, '_next_due', None):
+            delay = min(delay, max(0, min(self._next_due.values())-time.monotonic()))
+        event = getattr(self, '_completed_event', None)
+        if event is None or not getattr(self, '_futures', None):
+            stop.wait(delay)
+            return
+        deadline = time.monotonic()+delay
+        while not stop.is_set() and time.monotonic() < deadline:
+            if event.wait(min(0.2, max(0, deadline-time.monotonic()))):
+                return
+
+    def close(self):
+        executor = getattr(self, '_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        recovery = getattr(self, '_recovery_executor', None)
+        if recovery is not None:
+            recovery.shutdown(wait=True, cancel_futures=True)
+        discovery = getattr(self, '_discovery_executor', None)
+        if discovery is not None:
+            discovery.shutdown(wait=True, cancel_futures=True)
+
+    def poll_recovery(self, sender):
+        """Reconcile existing envelopes without blocking unrelated read work."""
+        future = getattr(self, '_recovery_future', None)
+        if future is not None:
+            if not future.done():
+                return
+            self._recovery_future = None
+            self._recovery_after = time.monotonic()+5
+            future.result()
+        if time.monotonic() < getattr(self, '_recovery_after', 0):
+            return
+        self._check_stop()
+        if not hasattr(self, '_recovery_executor'):
+            self._recovery_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='guardian-outbox')
+        self._recovery_future = self._recovery_executor.submit(sender.recover)
+        self._recovery_future.add_done_callback(lambda _: self._completed_event.set())
 
 
 def _initialize_worker(cfg, w3, account, stop_requested):
@@ -594,6 +744,7 @@ def _initialize_worker(cfg, w3, account, stop_requested):
         stop_requested=stop_requested,
         work_threads=settings.get('work_threads', 2),
         publication_transactions_per_turn=settings.get('publication_transactions_per_turn', 3),
+        expected_chain_id=settings['chain_id'],
         observe=lambda event: print('DKG duty status '+json.dumps(event, sort_keys=True), flush=True))
     sender.recover()
     worker.start()
@@ -625,15 +776,23 @@ def run(cfg, w3, account):
     else:
         return
     print('Guardian DKG recovery worker started; automatic acceptance follows operator limits', flush=True)
-    while not g_lifecycle.STOP.is_set():
-        try:
-            sender.recover()
-            for mat, kind in worker.scan():
-                log_every(('dkg-recovery-deferred', mat, kind),
-                    f'DKG recovery attempt {mat[:12]} deferred ({kind}); protected state retained', seconds=300)
-        except Exception as error:
-            # RPC exceptions can contain transaction payloads or local paths.
-            # Keep operator logs bounded and do not disclose private material.
-            log_every(('dkg-recovery-check', type(error).__name__),
-                f'DKG recovery check deferred ({type(error).__name__}); protected state retained', seconds=300)
-        g_lifecycle.STOP.wait(max(1, cfg.POLL_INTERVAL))
+    try:
+        while not g_lifecycle.STOP.is_set():
+            try:
+                recover = getattr(worker, 'poll_recovery', None)
+                recover(sender) if recover is not None else sender.recover()
+                for mat, kind in worker.scan():
+                    log_every(('dkg-recovery-deferred', mat, kind),
+                        f'DKG recovery attempt {mat[:12]} deferred ({kind}); protected state retained', seconds=300)
+            except Exception as error:
+                log_every(('dkg-recovery-check', type(error).__name__),
+                    f'DKG recovery check deferred ({type(error).__name__}); protected state retained', seconds=300)
+            waiting = getattr(worker, 'wait_for_work', None)
+            if waiting is None:
+                g_lifecycle.STOP.wait(max(1, cfg.POLL_INTERVAL))
+            else:
+                waiting(g_lifecycle.STOP, max(1, cfg.POLL_INTERVAL))
+    finally:
+        close = getattr(worker, 'close', None)
+        if close is not None:
+            close()
