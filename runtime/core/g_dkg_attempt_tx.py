@@ -21,13 +21,14 @@ PendingTransaction = PendingGuardianTransaction
 
 class DurableSender:
     def __init__(self, w3, account, *, nonce_root, max_gas=10_000_000,
-                 max_gas_price_wei, receipt_timeout=30):
+                 max_gas_price_wei, receipt_timeout=30, stop_requested=lambda: False):
         if not 21_000 <= max_gas <= 16_777_216 or max_gas_price_wei <= 0:
             raise ValueError('Set bounded recovery transaction gas and gas-price limits')
         self.w3, self.account = w3, account
         self.root = recovery_outbox_root(nonce_root)
         self.nonce_root, self.max_gas = nonce_root, max_gas
         self.max_gas_price, self.timeout = max_gas_price_wei, receipt_timeout
+        self.stop_requested = stop_requested
 
     def gas_quote(self, fn):
         price = int(self.w3.eth.gas_price)
@@ -81,14 +82,22 @@ class DurableSender:
                     receipt = self._finish(entry)
                     if entry['action'] == action:
                         return receipt
+            if self.stop_requested():
+                raise PendingTransaction('Guardian is stopping; no new envelope was signed')
             gas, price = self.gas_quote(fn)
             with _account_transaction_lock(self.nonce_root):
+                # Another job/PRE worker may have held the wallet lane while
+                # this job waited. Recheck before reserving or signing anew.
+                if self.stop_requested():
+                    raise PendingTransaction('Guardian is stopping; no new envelope was signed')
                 require_no_pending_heartbeat_transaction(self.nonce_root)
                 recover_regular_transaction(self.w3, self.account.address, self.nonce_root)
                 transaction = fn.build_transaction({'from': self.account.address,
                     'chainId': self.w3.eth.chain_id,
                     'nonce': next_guardian_nonce(self.w3, self.account.address, self.nonce_root),
                     'gas': gas, 'gasPrice': price})
+                if self.stop_requested():
+                    raise PendingTransaction('Guardian is stopping; no new envelope was signed')
                 raw = _raw_transaction(self.account.sign_transaction(transaction))
                 entry = {'chain_id': self.w3.eth.chain_id, 'address': self.account.address,
                          'hash': Web3.keccak(raw).hex(), 'raw': raw.hex(),

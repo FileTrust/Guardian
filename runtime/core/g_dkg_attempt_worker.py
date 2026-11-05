@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import random
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
@@ -43,7 +45,9 @@ class AttemptWorker:
     No import-time wallet/config reads and no implied acceptance defaults.
     """
     def __init__(self, w3, address, contracts, root, limits, profiles, submit, share_path, *, stop_requested=lambda: False,
-                 observe=lambda event: None):
+                 observe=lambda event: None, work_threads=2):
+        if type(work_threads) is not int or not 1 <= work_threads <= 4:
+            raise ValueError('Guardian work threads must be between one and four')
         self.w3, self.address, self.c = w3, Web3.to_checksum_address(address), contracts
         self.root, self.limits, self.profiles = Path(root), limits, profiles
         self.submit, self.share_path = submit, share_path
@@ -53,9 +57,19 @@ class AttemptWorker:
         self._observations = {}
         self._terminal_registry_ids = set()
         self._finality_anchor = None
+        self.work_threads = work_threads
+        self._observation_lock = threading.Lock()
 
     def _observe(self, mat, phase, reason, **details):
         """Public obligation identifiers/reasons only; no transaction payloads."""
+        # Old dependency-injected adapters may not configure concurrent work.
+        lock = getattr(self, '_observation_lock', None)
+        if lock is None:
+            return self._observe_locked(mat, phase, reason, **details)
+        with lock:
+            return self._observe_locked(mat, phase, reason, **details)
+
+    def _observe_locked(self, mat, phase, reason, **details):
         key = hex32(mat)
         state = (phase, reason)
         if self._observations.get(key) == state:
@@ -335,6 +349,11 @@ class AttemptWorker:
 
     def _disputes(self, mat, j, r, role, context):
         functions = self.c.manager.functions
+        # An authoritative zero means no complaint needs servicing now. Reads
+        # that fail still propagate; a new complaint is seen on the next turn
+        # and every publication keeps its own on-chain authorization checks.
+        if functions.pendingDisputes(mat).call() == 0:
+            return True
         # Each pair can open only one complaint. At most 20 public reads for
         # this dealer; no unbounded log-history scan is needed after restart.
         for index in range(1, len(r.receivers)+1):
@@ -441,7 +460,12 @@ class AttemptWorker:
                 return False  # Owner/settler closes it; G cannot promote it.
             self._profile(mat, j)
             if role.dealerIndex and timestamp <= a.workDeadline-j.receiverDuration:
-                if self._publish(mat, j, r, role, context) is False:
+                completed, _, _ = self.c.coordinator.functions.getAttemptWork(mat).call()
+                # This bit is set only after the exact attempt's batch,
+                # commitments and every required ciphertext are recorded.
+                # Re-read it each turn; no local completion cache can survive
+                # a reorg and falsely suppress required work.
+                if not (completed & (1 << (role.dealerIndex-1))) and self._publish(mat, j, r, role, context) is False:
                     return True
             if role.receiverIndex and self.c.controller.functions.materialsReady(mat).call():
                 self._receive(mat, j, r, role, context)
@@ -489,15 +513,32 @@ class AttemptWorker:
             # Discovery trouble must not withhold already accepted duties.
         acknowledged = []
         deadlines = {mat: saved.get('deadline', 0) for mat, saved in jobs}
-        for mat in sorted(pending, key=lambda m: (m not in committed, deadlines.get(m, 0), m)):
+        ordered = sorted(pending, key=lambda m: (m not in committed, deadlines.get(m, 0), m))
+        def process(mat):
             self._check_stop()
             try:
                 self.step(mat)
-                if mat in discovered:
-                    acknowledged.append(discovered[mat])
+                return mat, None
+            except WorkerStopping:
+                raise
             except Exception as error:
                 self._observe(mat, 'deferred', type(error).__name__)
-                errors.append((mat, type(error).__name__))
+                return mat, type(error).__name__
+        # Independent jobs overlap their public reads and preparation. The
+        # per-material locks, consent/catalog locks and durable sender's
+        # wallet-wide outbox/nonce locks remain the sole write authorities.
+        threads = getattr(self, 'work_threads', 1)
+        def collect(results):
+            for mat, error in results:
+                if error is not None:
+                    errors.append((mat, error))
+                elif mat in discovered:
+                    acknowledged.append(discovered[mat])
+        if threads > 1 and len(ordered) > 1:
+            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix='guardian-duty') as executor:
+                collect(executor.map(process, ordered))
+        else:
+            collect(map(process, ordered))
         if event_discovery is not None:
             event_discovery.acknowledge(acknowledged)
         return errors
@@ -523,9 +564,10 @@ def _initialize_worker(cfg, w3, account, stop_requested):
     limits = AcceptanceLimits.from_config(settings.get('acceptance', {}))
     sender = DurableSender(w3, account, nonce_root=cfg.ROOT,
         max_gas=int(settings.get('max_transaction_gas', 10_000_000)),
-        max_gas_price_wei=int(settings['max_gas_price_wei']))
+        max_gas_price_wei=int(settings['max_gas_price_wei']), stop_requested=stop_requested)
     worker = AttemptWorker(w3, account.address, c, root, limits, profiles, sender, v2_final_share_path,
         stop_requested=stop_requested,
+        work_threads=settings.get('work_threads', 2),
         observe=lambda event: print('DKG duty status '+json.dumps(event, sort_keys=True), flush=True))
     sender.recover()
     worker.start()
@@ -538,7 +580,9 @@ def run(cfg, w3, account):
     from .g_dkg_attempt_tx import PendingTransaction
     from .g_log import log_every
     from .g_dkg_rpc import install_read_pacing
-    install_read_pacing(w3, getattr(cfg, 'DKG_RECOVERY', {}).get('rpc_read_interval_seconds', 0), g_lifecycle.STOP)
+    settings = getattr(cfg, 'DKG_RECOVERY', {})
+    install_read_pacing(w3, settings.get('rpc_read_interval_seconds', 0), g_lifecycle.STOP,
+        minimum_interval=settings.get('rpc_min_read_interval_seconds'))
     delay = 2.0
     while not g_lifecycle.STOP.is_set():
         try:
