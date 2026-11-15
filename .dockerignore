@@ -3,6 +3,9 @@
 !requirements.txt
 !VERSION
 !guardian.py
+!diagnostics.py
+!ft_diagnostics.py
+!ft_diagnostics_policy.json
 !container_cli.py
 !github_auth.py
 !artifact_store.py
@@ -34,3 +37,6 @@
 **/wallet.json
 **/unlock.key
 **/.env*
+
+# Private local bug-report drafts are never source or image assets.
+**/.filetrust-diagnostics/

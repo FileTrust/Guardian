@@ -942,4 +942,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from core.ft_diagnostics import start
+    start(home=Path.cwd())
     main()

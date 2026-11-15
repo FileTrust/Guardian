@@ -354,6 +354,8 @@ def doctor(args):
 
 def run(args):
     state = args.home.resolve()
+    from ft_diagnostics import start
+    start(home=state)
     # Prevent two Guardian supervisors using the same wallet and state folder.
     lock = (state / ".run.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -408,6 +410,9 @@ def main():
     try:
         {"install": install, "doctor": doctor, "run": run,'claim-dkg':claim_dkg}[args.command](args)
     except (Exception, KeyboardInterrupt) as exc:
+        if args.command == "run":
+            from ft_diagnostics import capture_current
+            capture_current(exc, operation="startup", error_code="FT_STARTUP_FAILED", component="supervisor")
         # Exception details from key import/JSON parsing must never reveal inputs.
         safe = str(exc) if isinstance(exc, (ValueError, RuntimeError, PermissionError)) else type(exc).__name__
         say(f"Guardian stopped: {safe}")

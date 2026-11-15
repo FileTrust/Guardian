@@ -393,9 +393,13 @@ def main() -> int:
                 f"state preserved and retrying: {exc}",
                 flush=True,
             )
+            from core.ft_diagnostics import capture_current
+            capture_current(exc, operation="proof.generate", error_code="FT_PROOF_FAILED")
         time.sleep(_SHARE_PROOF_POLL_INTERVAL)
     return 0
 
 
 if __name__ == "__main__":
+    from core.ft_diagnostics import start
+    start(home=Path.cwd())
     raise SystemExit(main())

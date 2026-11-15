@@ -14,3 +14,6 @@ dist/
 
 .network-updates/
 network-config-active.json
+
+# Private local bug-report drafts are never source or image assets.
+**/.filetrust-diagnostics/

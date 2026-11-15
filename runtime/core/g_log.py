@@ -6,6 +6,7 @@ surfacing state transitions and periodic reminders.
 from __future__ import annotations
 
 import time
+import sys
 from typing import Any
 
 _LOG_STATE: dict = {}
@@ -14,6 +15,9 @@ _LOG_LAST_TIME: dict = {}
 
 def log_state(key: Any, state: Any, message: str) -> None:
     """Print *message* only when *state* for *key* changes."""
+    if sys.exc_info()[1] is not None:
+        from .ft_diagnostics import capture_current
+        capture_current()
     if _LOG_STATE.get(key) != state:
         print(message)
         _LOG_STATE[key] = state

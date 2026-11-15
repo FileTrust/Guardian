@@ -431,7 +431,7 @@ def _spawn(tag: str, script: str) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env={**os.environ, "FILETRUST_GUARDIAN_SUPERVISOR_PID": str(os.getpid())},
+        env={**os.environ, "FILETRUST_GUARDIAN_SUPERVISOR_PID": str(os.getpid()), "FILETRUST_DIAGNOSTICS_HOME": str(ROOT)},
         **child_lock_options(),
     )
     _PROCS.append(p)
@@ -457,6 +457,8 @@ def _stop_all() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    from core.ft_diagnostics import start
+    start(home=ROOT)
     g_lifecycle.install()
     allow_new_key = "--new-key" in sys.argv[1:]
     cfg = _load_cfg()
@@ -498,6 +500,8 @@ def main() -> int:
         while not g_lifecycle.STOP.wait(1):
             for p in _PROCS:
                 if p.poll() is not None:
+                    from core.ft_diagnostics import capture_current
+                    capture_current(operation="worker.supervise", error_code="FT_WORKER_EXITED", component="supervisor")
                     print(f"[{NAME}] subprocess exited (code={p.returncode}). Stopping.")
                     _stop_all()
                     return p.returncode or 1
