@@ -366,7 +366,8 @@ class AttemptWorker:
                 expected_chain_id=getattr(self, 'expected_chain_id', None))
             if public[0]:
                 if (bytes(active) != mat or public[1].lower() != self.address.lower() or
-                        tuple(public[2:]) != candidate or tuple(expected) != candidate):
+                        public[2] != index or tuple(public[3:]) != candidate or
+                        tuple(expected) != candidate):
                     raise RuntimeError('Acknowledged DKG share differs from protected candidate')
                 return  # Fresh matching on-chain evidence, not an in-memory done flag.
         total = 0
